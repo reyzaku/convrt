@@ -1,13 +1,14 @@
 'use client';
 
 import { useState } from 'react';
-import DropZone from './DropZone';
-import ProgressBar from './ProgressBar';
+import BatchDropZone from './BatchDropZone';
 import FFmpegLoader from './FFmpegLoader';
 import { loadFFmpeg, fetchFile, formatBytes, fileDataToBlob } from '@/lib/ffmpeg';
+import { type BatchItem, createBatchItems, makeOutputName } from '@/lib/batch';
+import { downloadAsZip } from '@/lib/zip';
 
 type Dither = 'bayer' | 'floyd_steinberg' | 'sierra2_4a' | 'none';
-type Status = 'idle' | 'loading' | 'ffmpeg' | 'gifsicle' | 'done' | 'error';
+type RunStatus = 'idle' | 'loading' | 'running' | 'done';
 
 const DITHER_OPTIONS: { value: Dither; label: string; hint: string }[] = [
   { value: 'bayer',           label: 'Bayer',           hint: 'Fast, good size reduction' },
@@ -17,305 +18,234 @@ const DITHER_OPTIONS: { value: Dither; label: string; hint: string }[] = [
 ];
 
 export default function GifOptimizer() {
-  const [file, setFile]             = useState<File | null>(null);
+  const [items, setItems]         = useState<BatchItem[]>([]);
+  const [runStatus, setRunStatus] = useState<RunStatus>('idle');
+  const [gifsicleActive, setGifsicleActive] = useState(false);
+  const [error, setError]         = useState<string | null>(null);
 
   // FFmpeg options
   const [colors, setColors]         = useState(128);
-  const [width, setWidth]           = useState(0);       // 0 = keep original
-  const [fps, setFps]               = useState(0);       // 0 = keep original
+  const [width, setWidth]           = useState(0);
+  const [fps, setFps]               = useState(0);
   const [dither, setDither]         = useState<Dither>('bayer');
   const [bayerScale, setBayerScale] = useState(2);
   const [optimizeBg, setOptimizeBg] = useState(false);
 
-  // Gifsicle lossy option
+  // Gifsicle lossy
   const [lossyEnabled, setLossyEnabled] = useState(false);
-  const [lossy, setLossy]               = useState(45);  // 1–200, recommended 30–60
+  const [lossy, setLossy]               = useState(45);
 
-  const [progress, setProgress]     = useState(0);
-  const [status, setStatus]         = useState<Status>('idle');
-  const [outputURL, setOutputURL]   = useState<string | null>(null);
-  const [outputSize, setOutputSize] = useState(0);
-  const [error, setError]           = useState<string | null>(null);
+  const addFiles   = (files: File[]) => setItems((p) => [...p, ...createBatchItems(files)]);
+  const removeItem = (id: string)    => setItems((p) => p.filter((i) => i.id !== id));
+  const updateItem = (id: string, patch: Partial<BatchItem>) =>
+    setItems((p) => p.map((i) => (i.id === id ? { ...i, ...patch } : i)));
 
-  const optimize = async () => {
-    if (!file) return;
+  const run = async () => {
+    const pending = items.filter((i) => i.status === 'pending');
+    if (pending.length === 0) return;
     setError(null);
-    setOutputURL(null);
-    setProgress(0);
+
+    const statsMode    = optimizeBg ? 'diff' : 'full';
+    const ditheringArg = dither === 'bayer'
+      ? `dither=bayer:bayer_scale=${bayerScale}` : `dither=${dither}`;
+    const prefixFilters = [
+      fps > 0   ? `fps=${fps}`                         : '',
+      width > 0 ? `scale=${width}:-1:flags=lanczos`   : '',
+    ].filter(Boolean).join(',');
+    const vf = `${prefixFilters ? prefixFilters + ',' : ''}split[s0][s1];[s0]palettegen=max_colors=${colors}:stats_mode=${statsMode}[p];[s1][p]paletteuse=${ditheringArg}`;
 
     try {
-      setStatus('loading');
+      setRunStatus('loading');
       const ffmpeg = await loadFFmpeg();
-      ffmpeg.on('progress', ({ progress: p }) => setProgress(p));
+      setRunStatus('running');
 
-      setStatus('ffmpeg');
-      await ffmpeg.writeFile('input.gif', await fetchFile(file));
+      const usedNames = new Set<string>();
 
-      // Build FFmpeg filtergraph
-      const parts: string[] = [];
-      if (fps > 0)   parts.push(`fps=${fps}`);
-      if (width > 0) parts.push(`scale=${width}:-1:flags=lanczos`);
+      for (const item of pending) {
+        updateItem(item.id, { status: 'processing', progress: 0 });
+        const handler = ({ progress: p }: { progress: number }) =>
+          updateItem(item.id, { progress: p });
+        ffmpeg.on('progress', handler);
 
-      const statsMode    = optimizeBg ? 'diff' : 'full';
-      const ditheringArg = dither === 'bayer'
-        ? `dither=bayer:bayer_scale=${bayerScale}`
-        : `dither=${dither}`;
+        try {
+          await ffmpeg.writeFile('input.gif', await fetchFile(item.file));
+          await ffmpeg.exec(['-i', 'input.gif', '-vf', vf, '-loop', '0', 'output.gif']);
 
-      const prefix = parts.length > 0 ? parts.join(',') + ',' : '';
-      const vf = `${prefix}split[s0][s1];[s0]palettegen=max_colors=${colors}:stats_mode=${statsMode}[p];[s1][p]paletteuse=${ditheringArg}`;
+          const data = await ffmpeg.readFile('output.gif');
+          let blob = fileDataToBlob(data, 'image/gif');
 
-      await ffmpeg.exec(['-i', 'input.gif', '-vf', vf, '-loop', '0', 'output.gif']);
+          await ffmpeg.deleteFile('input.gif');
+          await ffmpeg.deleteFile('output.gif');
 
-      const data = await ffmpeg.readFile('output.gif');
-      let outputBlob = fileDataToBlob(data, 'image/gif');
+          // Gifsicle lossy pass
+          if (lossyEnabled && lossy > 0) {
+            ffmpeg.off('progress', handler);
+            setGifsicleActive(true);
+            const gifsicle = (await import('gifsicle-wasm-browser')).default;
+            const inputFile = new File([blob], '1.gif', { type: 'image/gif' });
+            const results = await gifsicle.run({
+              input: [{ file: inputFile, name: '1.gif' }],
+              command: [`-O1 --lossy=${lossy} 1.gif -o /out/out.gif`],
+            });
+            setGifsicleActive(false);
+            if (results?.length > 0) blob = results[0];
+          }
 
-      await ffmpeg.deleteFile('input.gif');
-      await ffmpeg.deleteFile('output.gif');
-
-      // ── Gifsicle lossy pass (second pass) ──────────────────────────────
-      if (lossyEnabled && lossy > 0) {
-        setStatus('gifsicle');
-        setProgress(0);
-
-        // Dynamic import keeps gifsicle out of the initial bundle
-        const gifsicle = (await import('gifsicle-wasm-browser')).default;
-        const inputForGifsicle = new File([outputBlob], '1.gif', { type: 'image/gif' });
-
-        // -O1 is recommended for large files; -O2/-O3 are exponentially slower
-        const results = await gifsicle.run({
-          input: [{ file: inputForGifsicle, name: '1.gif' }],
-          command: [`-O1 --lossy=${lossy} 1.gif -o /out/out.gif`],
-        });
-
-        if (results && results.length > 0) {
-          outputBlob = results[0];
+          const outName = makeOutputName(item.file.name, '_optimized', 'gif', usedNames);
+          updateItem(item.id, { status: 'done', progress: 1, outputBlob: blob, outputName: outName });
+        } catch (err) {
+          setGifsicleActive(false);
+          updateItem(item.id, { status: 'error', error: err instanceof Error ? err.message : 'Failed' });
+        } finally {
+          ffmpeg.off('progress', handler);
         }
       }
-
-      setOutputURL(URL.createObjectURL(outputBlob));
-      setOutputSize(outputBlob.size);
-      setStatus('done');
     } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? err.message : 'Optimization failed');
-      setStatus('error');
+      setError(err instanceof Error ? err.message : 'Failed to load FFmpeg');
     }
+
+    setRunStatus('done');
   };
 
-  const reset = () => {
-    setFile(null);
-    setStatus('idle');
-    setOutputURL(null);
-    setProgress(0);
-    setError(null);
-  };
+  const reset = () => { setItems([]); setRunStatus('idle'); setError(null); setGifsicleActive(false); };
 
-  const isProcessing = status === 'loading' || status === 'ffmpeg' || status === 'gifsicle';
+  const doneItems    = items.filter((i) => i.status === 'done');
+  const isRunning    = runStatus === 'loading' || runStatus === 'running';
+  const pendingCount = items.filter((i) => i.status === 'pending').length;
+  const totalSaved   = doneItems.reduce(
+    (acc, i) => acc + (i.file.size - (i.outputBlob?.size ?? i.file.size)), 0
+  );
 
   return (
     <div className="space-y-6">
-      <DropZone
-        file={file}
-        onFile={setFile}
+      <BatchDropZone
+        items={items}
+        onAddFiles={addFiles}
+        onRemove={removeItem}
         accept=".gif,image/gif"
-        label="Drop a GIF here, or click to browse"
+        label="Drop GIF files here, or click to browse"
+        disabled={isRunning}
       />
 
-      {file && status === 'idle' && (
+      {items.length > 0 && (
         <div className="space-y-6">
-
-          {/* ── GIF Options ── */}
+          {/* GIF Options */}
           <Section title="GIF Options">
-            <SliderField
-              label="Palette Colors"
-              value={colors}
-              displayValue={String(colors)}
+            <SliderField label="Palette Colors" value={colors} displayValue={String(colors)}
               min={2} max={256} step={2}
-              hint="Fewer colors = smaller file. 256 = full palette (lossless re-encode)."
-              onChange={setColors}
-            />
-            <SliderField
-              label="Max FPS"
-              value={fps}
-              displayValue={fps === 0 ? 'Original' : String(fps)}
-              min={0} max={30} step={1}
-              hint="0 = keep original frame rate. Lower = smaller file."
-              onChange={setFps}
-            />
-            <SliderField
-              label="Resize Width (px)"
-              value={width}
-              displayValue={width === 0 ? 'Original' : String(width)}
-              min={0} max={1280} step={10}
-              hint="0 = keep original dimensions. Height scales automatically."
-              onChange={setWidth}
-            />
+              hint="Fewer colors = smaller file. 256 = full palette." onChange={setColors} />
+            <SliderField label="Max FPS" value={fps} displayValue={fps === 0 ? 'Original' : String(fps)}
+              min={0} max={30} step={1} hint="0 = keep original. Lower = smaller." onChange={setFps} />
+            <SliderField label="Resize Width (px)" value={width} displayValue={width === 0 ? 'Original' : String(width)}
+              min={0} max={1280} step={10} hint="0 = keep original dimensions." onChange={setWidth} />
           </Section>
 
-          {/* ── Optimize GIF ── */}
+          {/* Optimize GIF */}
           <Section title="Optimize GIF">
-            {/* Dithering */}
             <div className="space-y-2">
               <label className="text-sm text-zinc-400">Dithering Algorithm</label>
               <div className="grid grid-cols-2 gap-2">
                 {DITHER_OPTIONS.map((d) => (
-                  <button
-                    key={d.value}
-                    onClick={() => setDither(d.value)}
+                  <button key={d.value} onClick={() => setDither(d.value)}
                     className={`text-left px-3 py-2 rounded-lg border text-sm transition-all ${
                       dither === d.value
                         ? 'border-[#E85D20] bg-[#E85D20]/10 text-white'
                         : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
-                    }`}
-                  >
+                    }`}>
                     <span className="font-medium block">{d.label}</span>
                     <span className="text-xs text-zinc-600">{d.hint}</span>
                   </button>
                 ))}
               </div>
             </div>
-
             {dither === 'bayer' && (
-              <SliderField
-                label="Bayer Scale"
-                value={bayerScale}
-                displayValue={String(bayerScale)}
-                min={0} max={5} step={1}
-                hint="0 = fine dithering pattern, 5 = coarse."
-                onChange={setBayerScale}
-              />
+              <SliderField label="Bayer Scale" value={bayerScale} displayValue={String(bayerScale)}
+                min={0} max={5} step={1} hint="0 = fine, 5 = coarse." onChange={setBayerScale} />
             )}
-
-            <Toggle
-              label="Optimize for Static Background"
-              hint="Assigns more palette colors to moving parts — ideal for animations with a fixed background."
-              checked={optimizeBg}
-              onChange={setOptimizeBg}
-            />
+            <Toggle label="Optimize for Static Background"
+              hint="Assigns more palette colors to moving parts."
+              checked={optimizeBg} onChange={setOptimizeBg} />
           </Section>
 
-          {/* ── Lossy Compression (gifsicle) ── */}
+          {/* Lossy Compression */}
           <Section title="Lossy Compression">
-            {/* info badge */}
             <div className="flex items-start gap-3 rounded-lg bg-zinc-800/50 border border-zinc-700/50 px-3 py-2.5">
               <span className="text-lg leading-none mt-0.5">⚡</span>
-              <div className="text-xs text-zinc-400 leading-relaxed">
-                Powered by <span className="text-white font-medium">gifsicle</span> — the same engine
-                used by freeconvert, ezgif, and Squoosh. Can reduce a 30 MB GIF to under 6 MB
-                with minimal visible quality loss.
-              </div>
+              <p className="text-xs text-zinc-400 leading-relaxed">
+                Powered by <span className="text-white font-medium">gifsicle</span> — can reduce
+                a 30 MB GIF to under 6 MB with minimal visible quality loss.
+              </p>
             </div>
-
-            <Toggle
-              label="Enable Lossy Compression"
-              hint="Runs a second pass with gifsicle after FFmpeg. Adds a few seconds for large files."
-              checked={lossyEnabled}
-              onChange={setLossyEnabled}
-            />
-
+            <Toggle label="Enable Lossy Compression"
+              hint="Runs gifsicle after FFmpeg. Adds a few seconds per file for large GIFs."
+              checked={lossyEnabled} onChange={setLossyEnabled} />
             {lossyEnabled && (
-              <SliderField
-                label="Compression Level"
-                value={lossy}
-                displayValue={String(lossy)}
+              <SliderField label="Compression Level" value={lossy} displayValue={String(lossy)}
                 min={1} max={200} step={1}
                 hint={
-                  lossy <= 30  ? `${lossy} — Light: barely noticeable quality loss` :
-                  lossy <= 60  ? `${lossy} — Balanced: best size/quality trade-off ✓` :
+                  lossy <= 30  ? `${lossy} — Light: barely noticeable` :
+                  lossy <= 60  ? `${lossy} — Balanced: best trade-off ✓` :
                   lossy <= 100 ? `${lossy} — Aggressive: visible noise on gradients` :
                                  `${lossy} — Heavy: significant noise, extreme compression`
                 }
-                onChange={setLossy}
-              />
+                onChange={setLossy} />
             )}
           </Section>
 
-          <button
-            onClick={optimize}
-            className="w-full py-3 rounded-xl bg-[#E85D20] hover:bg-[#d94f14] text-white font-semibold transition-colors"
-          >
-            Optimize GIF
-          </button>
-        </div>
-      )}
+          {runStatus === 'loading' && <FFmpegLoader />}
 
-      {isProcessing && (
-        <div className="space-y-5">
-          {status === 'loading' && <FFmpegLoader />}
-
-          {status === 'ffmpeg' && (
-            <div className="space-y-2">
-              <ProgressBar progress={progress} label="Step 1 of 2 — FFmpeg palette optimization…" />
+          {runStatus === 'running' && gifsicleActive && (
+            <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 flex items-center gap-3">
+              <div className="h-4 w-4 rounded-full border-2 border-[#E85D20] border-t-transparent animate-spin flex-shrink-0" />
+              <div>
+                <p className="text-sm text-white font-medium">Gifsicle lossy pass…</p>
+                <p className="text-xs text-zinc-500 mt-0.5">Applying lossy LZW compression</p>
+              </div>
             </div>
           )}
 
-          {status === 'gifsicle' && (
-            <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-3">
-              <div className="flex items-center gap-3">
-                <div className="h-4 w-4 rounded-full border-2 border-[#E85D20] border-t-transparent animate-spin flex-shrink-0" />
+          {!isRunning && pendingCount > 0 && (
+            <button onClick={run}
+              className="w-full py-3 rounded-xl bg-[#E85D20] hover:bg-[#d94f14] text-white font-semibold transition-colors">
+              Optimize {pendingCount} GIF{pendingCount !== 1 ? 's' : ''}
+            </button>
+          )}
+
+          {doneItems.length > 0 && !isRunning && (
+            <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-1">
+              <div className="flex items-center justify-between flex-wrap gap-3">
                 <div>
-                  <p className="text-sm text-white font-medium">Step 2 of 2 — Gifsicle lossy pass</p>
-                  <p className="text-xs text-zinc-500 mt-0.5">Applying lossy LZW compression — this is where the big size savings happen</p>
+                  <p className="text-sm text-white font-medium">{doneItems.length}/{items.length} optimized</p>
+                  {totalSaved > 0 && (
+                    <p className="text-xs text-green-400">{formatBytes(totalSaved)} saved total</p>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  {doneItems.length >= 2 && (
+                    <button onClick={() => downloadAsZip(items, 'convrt-optimized-gifs.zip')}
+                      className="px-4 py-2 rounded-lg bg-[#E85D20] hover:bg-[#d94f14] text-white text-sm font-semibold transition-colors">
+                      Download All (ZIP)
+                    </button>
+                  )}
+                  <button onClick={reset}
+                    className="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm transition-colors">
+                    Reset
+                  </button>
                 </div>
               </div>
             </div>
           )}
-        </div>
-      )}
 
-      {status === 'done' && outputURL && (
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
-          <img src={outputURL} alt="Optimized GIF" className="w-full rounded-lg max-h-60 object-contain" />
-          <div className="flex items-center justify-between">
-            <div className="text-sm text-zinc-400 space-y-0.5">
-              <p>Input:  <span className="text-zinc-300">{formatBytes(file?.size ?? 0)}</span></p>
-              <p>Output: <span className="text-white font-medium">{formatBytes(outputSize)}</span></p>
-              {file && outputSize < file.size && (
-                <p className="text-green-400 font-medium">
-                  Saved {Math.round((1 - outputSize / file.size) * 100)}%
-                  <span className="text-zinc-600 font-normal ml-1">
-                    ({formatBytes(file.size - outputSize)} smaller)
-                  </span>
-                </p>
-              )}
-              {file && outputSize >= file.size && (
-                <p className="text-yellow-500 text-xs">File grew — try fewer colors, lower FPS, or enable lossy compression</p>
-              )}
-            </div>
-            <span className="text-xs text-green-400 bg-green-400/10 px-2 py-1 rounded-full">Done</span>
-          </div>
-          <div className="flex gap-3">
-            <a
-              href={outputURL}
-              download="convrt-optimized.gif"
-              className="flex-1 text-center py-3 rounded-xl bg-[#E85D20] hover:bg-[#d94f14] text-white font-semibold transition-colors"
-            >
-              Download GIF
-            </a>
-            <button
-              onClick={reset}
-              className="px-4 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors"
-            >
-              Reset
-            </button>
-          </div>
-        </div>
-      )}
-
-      {status === 'error' && (
-        <div className="rounded-xl bg-red-950/40 border border-red-900/50 p-4 space-y-3">
-          <p className="text-red-400 text-sm">{error}</p>
-          <button onClick={reset} className="text-sm text-zinc-400 hover:text-white transition-colors">
-            Try again
-          </button>
+          {error && (
+            <p className="text-red-400 text-sm rounded-xl bg-red-950/40 border border-red-900/50 px-4 py-3">{error}</p>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-/* ── Shared sub-components ── */
-
+/* ── Sub-components ── */
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
@@ -327,17 +257,8 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function SliderField({
-  label, value, displayValue, min, max, step, hint, onChange,
-}: {
-  label: string;
-  value: number;
-  displayValue: string;
-  min: number;
-  max: number;
-  step: number;
-  hint?: string;
-  onChange: (v: number) => void;
+function SliderField({ label, value, displayValue, min, max, step, hint, onChange }: {
+  label: string; value: number; displayValue: string; min: number; max: number; step: number; hint?: string; onChange: (v: number) => void;
 }) {
   return (
     <div className="space-y-1.5">
@@ -345,33 +266,23 @@ function SliderField({
         <span className="text-zinc-400">{label}</span>
         <span className="text-white font-medium">{displayValue}</span>
       </div>
-      <input
-        type="range"
-        min={min} max={max} step={step} value={value}
+      <input type="range" min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full accent-[#E85D20] cursor-pointer"
-      />
+        className="w-full accent-[#E85D20] cursor-pointer" />
       {hint && <p className="text-xs text-zinc-600">{hint}</p>}
     </div>
   );
 }
 
-function Toggle({
-  label, hint, checked, onChange,
-}: {
-  label: string;
-  hint?: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
+function Toggle({ label, hint, checked, onChange }: {
+  label: string; hint?: string; checked: boolean; onChange: (v: boolean) => void;
 }) {
   return (
     <label className="flex items-start gap-3 cursor-pointer group">
-      <div
-        onClick={() => onChange(!checked)}
+      <div onClick={() => onChange(!checked)}
         className={`mt-0.5 w-5 h-5 rounded flex-shrink-0 border-2 flex items-center justify-center transition-all ${
           checked ? 'bg-[#E85D20] border-[#E85D20]' : 'border-zinc-600 group-hover:border-zinc-400'
-        }`}
-      >
+        }`}>
         {checked && <span className="text-white text-xs leading-none">✓</span>}
       </div>
       <div>
