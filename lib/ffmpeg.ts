@@ -22,7 +22,10 @@ export async function loadFFmpeg(
     const ffmpeg = getFFmpeg();
     if (ffmpeg.loaded) return ffmpeg;
 
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+    // jsDelivr reliably serves Access-Control-Allow-Origin: * on every file,
+    // unlike unpkg which can return responses without CORS headers on the
+    // worker file — causing failures under our require-corp COEP policy.
+    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
 
     const [coreURL, wasmURL, workerURL] = await Promise.all([
       toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
