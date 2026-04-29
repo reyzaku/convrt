@@ -1,101 +1,88 @@
-import Image from "next/image";
+'use client';
+
+import { useState } from 'react';
+import dynamic from 'next/dynamic';
+
+const VideoConverter = dynamic(() => import('@/components/VideoConverter'), { ssr: false });
+const VideoToGif = dynamic(() => import('@/components/VideoToGif'), { ssr: false });
+const GifOptimizer = dynamic(() => import('@/components/GifOptimizer'), { ssr: false });
+const VideoCompressor = dynamic(() => import('@/components/VideoCompressor'), { ssr: false });
+
+const TABS = [
+  { id: 'converter', label: 'Video Converter', icon: '🎞️' },
+  { id: 'to-gif', label: 'Video → GIF', icon: '🎨' },
+  { id: 'gif-optimizer', label: 'GIF Optimizer', icon: '⚡' },
+  { id: 'compressor', label: 'Compressor', icon: '📦' },
+] as const;
+
+type TabId = typeof TABS[number]['id'];
 
 export default function Home() {
-  return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="https://nextjs.org/icons/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
+  const [activeTab, setActiveTab] = useState<TabId>('converter');
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="https://nextjs.org/icons/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+  return (
+    <main className="min-h-screen" style={{ background: '#0D0D0D' }}>
+      {/* Header */}
+      <header className="border-b border-zinc-900 px-4 py-5">
+        <div className="max-w-2xl mx-auto flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight text-white">
+              CONV<span style={{ color: '#E85D20' }}>RT</span>
+            </h1>
+            <p className="text-xs text-zinc-600 mt-0.5">Browser-based · No upload · 100% private</p>
+          </div>
+          <div className="flex items-center gap-2 text-xs text-zinc-600 bg-zinc-900 px-3 py-1.5 rounded-full border border-zinc-800">
+            <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
+            Powered by FFmpeg.wasm
+          </div>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
+      </header>
+
+      {/* Tab navigation */}
+      <nav className="border-b border-zinc-900 overflow-x-auto">
+        <div className="max-w-2xl mx-auto flex">
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex items-center gap-2 px-4 py-4 text-sm font-medium whitespace-nowrap border-b-2 transition-all ${
+                activeTab === tab.id
+                  ? 'border-[#E85D20] text-white'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              <span>{tab.icon}</span>
+              <span className="hidden sm:inline">{tab.label}</span>
+              <span className="sm:hidden">{tab.label.split(' ')[0]}</span>
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      {/* Tool panel */}
+      <div className="max-w-2xl mx-auto px-4 py-8">
+        <div className="mb-6">
+          <h2 className="text-lg font-semibold text-white">
+            {TABS.find((t) => t.id === activeTab)?.label}
+          </h2>
+          <p className="text-sm text-zinc-600 mt-0.5">
+            {activeTab === 'converter' && 'Convert between video formats locally in your browser.'}
+            {activeTab === 'to-gif' && 'Turn any video clip into a high-quality animated GIF.'}
+            {activeTab === 'gif-optimizer' && 'Reduce GIF file size by optimizing palette and dimensions.'}
+            {activeTab === 'compressor' && 'Shrink video files with fine-grained quality control.'}
+          </p>
+        </div>
+
+        {activeTab === 'converter' && <VideoConverter />}
+        {activeTab === 'to-gif' && <VideoToGif />}
+        {activeTab === 'gif-optimizer' && <GifOptimizer />}
+        {activeTab === 'compressor' && <VideoCompressor />}
+      </div>
+
+      {/* Footer */}
+      <footer className="text-center pb-8 text-xs text-zinc-700">
+        Files never leave your machine — all processing happens in the browser.
       </footer>
-    </div>
+    </main>
   );
 }
